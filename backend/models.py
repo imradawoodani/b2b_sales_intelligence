@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy import Column, Integer, String, Float, Text, DateTime, Boolean
 from sqlalchemy.sql import func
 from database import Base
@@ -33,6 +35,26 @@ class Contractor(Base):
     priority_score = Column(Integer)             # 0-100
     brief = Column(Text)
     talking_points = Column(Text)                # JSON array stored as string
+
+    @property
+    def perplexity_score(self):
+        if not self.perplexity_raw:
+            return None
+        try:
+            payload = json.loads(self.perplexity_raw)
+            return payload.get("decision", {}).get("perplexity_score")
+        except Exception:
+            return None
+
+    @property
+    def perplexity_insights(self):
+        if not self.perplexity_raw:
+            return None
+        try:
+            payload = json.loads(self.perplexity_raw)
+            return payload.get("decision", {}).get("reasoning")
+        except Exception:
+            return None
     score_breakdown = Column(Text)               # JSON object stored as string
 
     # --- Pipeline metadata ---

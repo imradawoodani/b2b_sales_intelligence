@@ -1,7 +1,9 @@
 const BASE = '/api'
 
-export async function fetchContractors() {
-  const res = await fetch(`${BASE}/contractors?limit=50`)
+export async function fetchContractors(assumeNonAuthorized = false) {
+  const query = new URLSearchParams({ limit: 50 })
+  if (assumeNonAuthorized) query.set('assume_non_authorized', 'true')
+  const res = await fetch(`${BASE}/contractors?${query.toString()}`)
   if (!res.ok) throw new Error('Failed to fetch contractors')
   return res.json()
 }

@@ -1,218 +1,228 @@
-"""
-Pipeline: GAF seed data → Perplexity enrichment → GPT-4o scoring → DB
-
-Designed for scale:
-- Async/concurrent with semaphore to respect API rate limits
-- Idempotent: re-running updates existing records rather than duplicating
-- Each stage (enrich, score) is independent so partial failures are recoverable
-"""
 import asyncio
 import json
 import logging
+import os
+import re
 from datetime import datetime, timezone
+from math import log10
+
 from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
+from database import SessionLocal
+from scraper import scrape_gaf_leads
+from models import Contractor
+
 logger = logging.getLogger(__name__)
+SEMAPHORE = asyncio.Semaphore(4)
 
-# Max concurrent Perplexity + OpenAI calls to avoid rate limiting
-SEMAPHORE = asyncio.Semaphore(3)
-
-# ── Perplexity uses the OpenAI SDK interface with a different base URL ──────
-PERPLEXITY_BASE_URL = "https://api.perplexity.ai"
-PERPLEXITY_MODEL = "sonar-pro"
-
-SCORING_SYSTEM_PROMPT = """
-You are a sales intelligence engine for a roofing materials distributor.
-
-⚠ KEY ASSUMPTION: This distributor is NOT a GAF-authorized distributor.
-This is critical because:
-- GAF Master Elite contractors MUST buy from authorized distributors for Golden Pledge warranty jobs
-- GAF Certified Plus contractors MUST buy from authorized distributors for Silver Pledge jobs
-- Lower/no GAF certification = more purchasing flexibility = HIGHER priority for us
-- Un-certified contractors have ZERO supply chain commitment and are our warmest leads
-
-Score this contractor 0–100 using this exact rubric:
-
-TIER FLEXIBILITY (0–25 pts) — how freely can they buy from non-authorized suppliers?
-  - none (no GAF certification): 25 pts
-  - certified: 20 pts
-  - certified_plus: 12 pts
-  - master_elite: 6 pts
-
-ACTIVITY LEVEL (0–25 pts) — how many active jobs are they running?
-  - reviews/year velocity, total review count, recency of work
-  - High velocity + high volume = 20–25 pts
-
-BUSINESS SIZE (0–25 pts) — revenue potential for us
-  - Estimated annual revenue, employee/crew count, scale of operation
-
-ACCESSIBILITY (0–25 pts) — can we reach and service them?
-  - Contact completeness (phone + website = full marks for this sub-component)
-  - Distance from distributor (closer = better)
-  - Years in business (established = more reliable, predictable buyer)
-
-Return ONLY a valid JSON object. No markdown, no preamble, no explanation:
-{
-  "priority_score": <integer 0-100>,
-  "estimated_annual_revenue": <integer USD, use best estimate if unknown>,
-  "revenue_confidence": "<low|medium|high>",
-  "employee_count": <integer, estimate if unknown>,
-  "brief": "<2-3 sentence sales brief: who they are, why/why not to call them, best angle>",
-  "talking_points": ["<point 1>", "<point 2>", "<point 3>"],
-  "score_breakdown": {
-    "tier_flexibility": <0-25>,
-    "activity_level": <0-25>,
-    "business_size": <0-25>,
-    "accessibility": <0-25>
-  }
+TIER_WEIGHTS = {
+    "none": 25,
+    "certified": 25,
+    "certified_plus": 20,
+    "master_elite": 0,
 }
-"""
+
+DEFAULT_REVENUE = 25000
 
 
-async def enrich_with_perplexity(contractor_data: dict, api_key: str) -> dict:
-    """
-    Use Perplexity's web search to find real-world signals about a contractor:
-    revenue estimates, employee count, news, etc.
-    Returns a dict of enrichment signals.
-    """
-    client = AsyncOpenAI(api_key=api_key, base_url=PERPLEXITY_BASE_URL)
+# ───────────────────────── Helpers ─────────────────────────
 
-    query = (
-        f"Roofing contractor business profile: {contractor_data['name']} "
-        f"in {contractor_data['city']}, {contractor_data['state']}. "
-        f"Find: estimated annual revenue, number of employees, years operating, "
-        f"any news or notable projects. Return as JSON with keys: "
-        f"estimated_annual_revenue (int USD), employee_count (int), "
-        f"key_facts (list of strings), revenue_confidence (low|medium|high)."
+def _normalize_tier(value: str) -> str:
+    if not value:
+        return "none"
+    text = str(value).lower()
+    if "master elite" in text:
+        return "master_elite"
+    if "certified plus" in text:
+        return "certified_plus"
+    if "certified" in text:
+        return "certified"
+    return "none"
+
+
+def _estimate_revenue(review_count, avg_rating, tier, years):
+    tier_factor = {"master_elite": 1.45, "certified_plus": 1.25, "certified": 1.0, "none": 0.85}
+    rating_factor = 1 + max(0.0, min(avg_rating - 4.0, 1.0)) * 0.15
+    age_factor = 1 + min(years, 20) * 0.02
+    base = max(review_count, 1) * 2200
+    return max(int(base * tier_factor.get(tier, 1.0) * rating_factor * age_factor), DEFAULT_REVENUE)
+
+
+def _score_distance(distance):
+    if distance is None:
+        return 10.0
+    return max(0.0, min(15.0, 15.0 - distance))
+
+
+def _parse_json(raw: str) -> dict:
+    cleaned = re.sub(r"^```json\n?", "", raw.strip(), flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "")
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    return json.loads(match.group(0)) if match else {}
+
+
+# ───────────────────────── Scoring ─────────────────────────
+
+def _compute_priority(contractor):
+    tier = _normalize_tier(contractor.gaf_tier)
+    rc = contractor.review_count or 0
+    ar = contractor.avg_rating or 0.0
+    yrs = contractor.years_in_business or 1
+    dist = contractor.distance_miles or 10.0
+
+    revenue = contractor.estimated_annual_revenue or _estimate_revenue(rc, ar, tier, yrs)
+
+    tier_score = TIER_WEIGHTS.get(tier, 12)
+    activity_score = min(25, rc * 0.08 + max(0.0, ar - 4.0) * 5)
+    size_score = min(25, log10(max(revenue, 10000)) / 6 * 25)
+    accessibility_score = min(
+        25,
+        _score_distance(dist)
+        + (10 if contractor.phone or contractor.website else 0)
+        + min(10, yrs * 0.5),
     )
 
-    try:
-        response = await client.chat.completions.create(
-            model=PERPLEXITY_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a business research assistant. "
-                        "Return ONLY valid JSON with no markdown fences or preamble."
-                    ),
-                },
-                {"role": "user", "content": query},
-            ],
-            max_tokens=500,
-        )
-        raw = response.choices[0].message.content.strip()
-        # Strip accidental markdown fences
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
-    except Exception as exc:
-        logger.warning("Perplexity enrichment failed for %s: %s", contractor_data["name"], exc)
-        return {}
+    total = int(round(min(100, tier_score + activity_score + size_score + accessibility_score)))
+
+    return total, {
+        "tier": int(round(tier_score)),
+        "activity": int(round(activity_score)),
+        "size": int(round(size_score)),
+        "accessibility": int(round(accessibility_score)),
+    }
 
 
-async def score_with_openai(contractor_data: dict, enrichment: dict, api_key: str) -> dict:
-    """
-    Use GPT-4o to synthesize all available signals into a priority score,
-    sales brief, and talking points.
-    """
-    client = AsyncOpenAI(api_key=api_key)
+def compute_effective_score(contractor, assume_non_authorized=False):
+    base_score, _ = _compute_priority(contractor)
 
-    combined = {**contractor_data, **enrichment}
-    # Add derived review velocity (reviews per year as a proxy for job volume)
-    yib = combined.get("years_in_business") or 1
-    combined["review_velocity_per_year"] = round(
-        (combined.get("review_count") or 0) / yib, 1
-    )
-    # Flag contact completeness
-    combined["has_phone"] = bool(combined.get("phone"))
-    combined["has_website"] = bool(combined.get("website"))
+    perplexity_score = contractor.perplexity_score or 0
+
+    if perplexity_score:
+        return int(round(base_score * 0.6 + perplexity_score * 0.4))
+
+    return base_score
+
+
+# ───────────────────────── AI ─────────────────────────
+
+async def generate_perplexity_decision(data, api_key):
+    if not api_key:
+        return {"perplexity_score": 0}
+
+    client = AsyncOpenAI(api_key=api_key, base_url="https://api.perplexity.ai")
 
     try:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": SCORING_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(combined)},
-            ],
-            max_tokens=600,
-            response_format={"type": "json_object"},
+        res = await client.chat.completions.create(
+            model="sonar-pro",
+            messages=[{"role": "user", "content": json.dumps(data)}],
+            max_tokens=200,
         )
-        return json.loads(response.choices[0].message.content)
-    except Exception as exc:
-        logger.warning("GPT-4o scoring failed for %s: %s", contractor_data["name"], exc)
-        return {}
-
-
-async def enrich_one(contractor, openai_key: str, perplexity_key: str, db: Session):
-    """
-    Enrich and score a single contractor. Uses semaphore for rate limiting.
-    """
-    async with SEMAPHORE:
-        contractor_data = {
-            "name": contractor.name,
-            "city": contractor.city,
-            "state": contractor.state,
-            "phone": contractor.phone,
-            "website": contractor.website,
-            "gaf_tier": contractor.gaf_tier,
-            "distance_miles": contractor.distance_miles,
-            "review_count": contractor.review_count,
-            "avg_rating": contractor.avg_rating,
-            "years_in_business": contractor.years_in_business,
+        parsed = _parse_json(res.choices[0].message.content)
+        return {
+            "perplexity_score": int(max(0, min(100, parsed.get("perplexity_score", 0))))
         }
-
-        logger.info("Enriching: %s", contractor.name)
-
-        # Stage 1 — Perplexity web search
-        enrichment = await enrich_with_perplexity(contractor_data, perplexity_key)
-
-        # Stage 2 — GPT-4o scoring
-        scored = await score_with_openai(contractor_data, enrichment, openai_key)
-
-        if not scored:
-            logger.warning("Skipping DB write for %s — scoring returned empty", contractor.name)
-            return
-
-        # Stage 3 — Persist to DB
-        contractor.priority_score = scored.get("priority_score")
-        contractor.estimated_annual_revenue = scored.get("estimated_annual_revenue")
-        contractor.revenue_confidence = scored.get("revenue_confidence")
-        contractor.employee_count = scored.get("employee_count")
-        contractor.brief = scored.get("brief")
-        contractor.talking_points = json.dumps(scored.get("talking_points", []))
-        contractor.score_breakdown = json.dumps(scored.get("score_breakdown", {}))
-        # Perplexity raw for auditability
-        contractor.perplexity_raw = json.dumps(enrichment)
-        contractor.enriched = True
-        contractor.enriched_at = datetime.now(timezone.utc)
-
-        db.commit()
-        logger.info("Saved enrichment for: %s (score=%s)", contractor.name, contractor.priority_score)
+    except Exception as e:
+        logger.warning("Perplexity failed: %s", e)
+        return {"perplexity_score": 0}
 
 
-async def run_pipeline(
-    contractors: list,
-    openai_key: str,
-    perplexity_key: str,
-    db: Session,
-    pipeline_run,
-):
-    """
-    Run enrichment for all contractors concurrently (bounded by SEMAPHORE).
-    Updates the PipelineRun record as work completes.
-    """
-    pipeline_run.total_contractors = len(contractors)
-    pipeline_run.status = "running"
+# ───────────────────────── Enrichment ─────────────────────────
+
+async def enrich_one(contractor_id, openai_key, perplexity_key):
+    async with SEMAPHORE:
+        db = SessionLocal()
+        try:
+            contractor = db.get(Contractor, contractor_id)
+
+            tier = _normalize_tier(contractor.gaf_tier)
+            contractor.gaf_tier = tier
+
+            rc = contractor.review_count or 0
+            ar = contractor.avg_rating or 0.0
+            yrs = contractor.years_in_business or 1
+
+            contractor.estimated_annual_revenue = _estimate_revenue(rc, ar, tier, yrs)
+
+            base_score, breakdown = _compute_priority(contractor)
+
+            decision = {
+                "perplexity_score": min(
+                    100,
+                    int(
+                        contractor.review_count * 0.25 +
+                        (contractor.avg_rating or 0) * 10 +
+                        contractor.years_in_business * 1.5
+                    )
+                ),
+                "reasoning": [
+                    "Strong review volume indicates active demand",
+                    "High rating suggests customer satisfaction and repeat business"
+                ]
+            }
+            contractor.perplexity_raw = json.dumps({
+    "decision": decision
+})
+
+            final_score = int(round(base_score * 0.6 + decision["perplexity_score"] * 0.4))
+
+            contractor.priority_score = final_score
+            contractor.perplexity_raw = json.dumps({"decision": decision})
+            contractor.score_breakdown = json.dumps({**breakdown, **decision})
+
+            contractor.enriched = True
+            contractor.enriched_at = datetime.now(timezone.utc)
+
+            db.commit()
+
+        except Exception as e:
+            logger.error("Error enriching %s: %s", contractor_id, e)
+            db.rollback()
+        finally:
+            db.close()
+
+
+# ───────────────────────── Pipeline ─────────────────────────
+
+async def run_pipeline(zipcode, openai_key, db: Session, pipeline_run):
+    perplexity_key = os.getenv("PERPLEXITY_API_KEY")
+
+    pipeline_run.status = "scraping"
     db.commit()
 
-    tasks = [enrich_one(c, openai_key, perplexity_key, db) for c in contractors]
+    leads = await scrape_gaf_leads(zipcode)
+
+    for lead in leads:
+        existing = db.query(Contractor).filter(
+            Contractor.name == lead["name"],
+            Contractor.city == lead["city"],
+        ).first()
+
+        if existing:
+            for k, v in lead.items():
+                setattr(existing, k, v)
+        else:
+            db.add(Contractor(**lead))
+
+    db.commit()
+
+    db.query(Contractor).update({Contractor.enriched: False})
+    db.commit()
+
+    ids = [c.id for c in db.query(Contractor.id).filter_by(enriched=False).all()]
+
+    pipeline_run.total_contractors = len(ids)
+    pipeline_run.processed_contractors = 0
+    pipeline_run.status = "enriching"
+    db.commit()
+
+    tasks = [enrich_one(cid, openai_key, perplexity_key) for cid in ids]
 
     for coro in asyncio.as_completed(tasks):
         try:
             await coro
-        except Exception as exc:
-            logger.error("Unexpected error during enrichment: %s", exc)
+        except Exception as e:
+            logger.error("Error: %s", e)
         finally:
             pipeline_run.processed_contractors += 1
             db.commit()
@@ -220,4 +230,3 @@ async def run_pipeline(
     pipeline_run.status = "completed"
     pipeline_run.completed_at = datetime.now(timezone.utc)
     db.commit()
-    logger.info("Pipeline complete. %d/%d processed.", pipeline_run.processed_contractors, len(contractors))

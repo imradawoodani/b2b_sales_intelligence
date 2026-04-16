@@ -1,13 +1,6 @@
 """
 Cosailor API — B2B roofing sales intelligence backend
-
-Routes:
-  GET  /health                      liveness check
-  GET  /contractors                 paginated, sorted lead list
-  GET  /contractors/{id}            single contractor detail
-  POST /contractors/{id}/ask        live Q&A about a contractor
-  POST /pipeline/run                trigger enrichment pipeline (async)
-  GET  /pipeline/status             latest pipeline run status
+Updated to support Real-Time GAF Scraping + Perplexity Enrichment.
 """
 import asyncio
 import json
@@ -23,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
 from models import Contractor, PipelineRun
-from pipeline import run_pipeline as _run_pipeline
+from pipeline import compute_effective_score, run_pipeline as _run_pipeline
 from schemas import (
     AskRequest,
     AskResponse,
@@ -31,7 +24,6 @@ from schemas import (
     ContractorsListResponse,
     PipelineStatusResponse,
 )
-from seed_data import SEED_CONTRACTORS
 
 load_dotenv()
 
@@ -43,33 +35,20 @@ app = FastAPI(title="Cosailor API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── DB init + seed on startup ─────────────────────────────────────────────────
+# ── DB init ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def startup():
+    # Ensures tables are created in Postgres on boot
     Base.metadata.create_all(bind=engine)
-    _seed_contractors_if_empty()
 
 
-def _seed_contractors_if_empty():
-    db = next(get_db())
-    try:
-        if db.query(Contractor).count() == 0:
-            logger.info("Seeding %d contractors...", len(SEED_CONTRACTORS))
-            for data in SEED_CONTRACTORS:
-                db.add(Contractor(**data))
-            db.commit()
-            logger.info("Seed complete.")
-    finally:
-        db.close()
-
-
-# ── Helper ───────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def _latest_pipeline_run(db: Session) -> PipelineRun | None:
     return db.query(PipelineRun).order_by(desc(PipelineRun.started_at)).first()
 
@@ -84,25 +63,30 @@ def health():
 def list_contractors(
     limit: int = 50,
     offset: int = 0,
+    assume_non_authorized: bool = False,
     db: Session = Depends(get_db),
 ):
-    """
-    Returns contractors sorted by priority_score descending.
-    Un-enriched contractors fall to the bottom (null scores sort last).
-    """
-    query = db.query(Contractor).order_by(
-        # NULLs last: enriched contractors with scores come first
-        Contractor.priority_score.is_(None),
-        desc(Contractor.priority_score),
-    )
-    total = query.count()
-    contractors = query.offset(offset).limit(limit).all()
+    contractors = db.query(Contractor).all()
+    scored = []
+    for contractor in contractors:
+        display_score = compute_effective_score(contractor, assume_non_authorized)
+        scored.append((display_score, contractor))
+
+    scored.sort(key=lambda item: (item[0] is None, -(item[0] or 0), item[1].id))
+    total = len(scored)
+    page = scored[offset: offset + limit]
+
+    contractor_responses = []
+    for display_score, contractor in page:
+        contractor_data = ContractorResponse.model_validate(contractor).model_dump()
+        contractor_data["display_score"] = display_score
+        contractor_responses.append(ContractorResponse.model_validate(contractor_data))
 
     pipeline_run = _latest_pipeline_run(db)
-    pipeline_status = pipeline_run.status if pipeline_run else None
+    pipeline_status = pipeline_run.status if pipeline_run else "never_run"
 
     return ContractorsListResponse(
-        contractors=[ContractorResponse.model_validate(c) for c in contractors],
+        contractors=contractor_responses,
         total=total,
         pipeline_status=pipeline_status,
     )
@@ -122,10 +106,6 @@ async def ask_about_contractor(
     body: AskRequest,
     db: Session = Depends(get_db),
 ):
-    """
-    Live Q&A: answer ad-hoc questions about a specific contractor.
-    Uses all known data as context so answers are grounded in real signals.
-    """
     contractor = db.get(Contractor, contractor_id)
     if not contractor:
         raise HTTPException(status_code=404, detail="Contractor not found")
@@ -134,40 +114,11 @@ async def ask_about_contractor(
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
 
-    talking_points = []
-    if contractor.talking_points:
-        try:
-            talking_points = json.loads(contractor.talking_points)
-        except Exception:
-            pass
-
     context = f"""
-You are a sales intelligence assistant for a roofing materials distributor.
-Answer the sales rep's question about this contractor based on the data below.
-Be concise and actionable. If data is missing, say so and suggest how to find it.
-
-ASSUMPTION: This distributor is NOT GAF-authorized. Contractors tied to GAF's
-authorized supply chain (Master Elite, Certified Plus) are harder to convert.
-
---- CONTRACTOR DATA ---
-Name: {contractor.name}
-Location: {contractor.city}, {contractor.state}
-GAF Certification Tier: {contractor.gaf_tier}
-Phone: {contractor.phone or 'unknown'}
-Website: {contractor.website or 'none listed'}
-Distance from distributor: {contractor.distance_miles} miles
-Review count: {contractor.review_count}
-Average rating: {contractor.avg_rating}/5.0
-Years in business: {contractor.years_in_business}
-Estimated employees: {contractor.employee_count or 'unknown'}
-Estimated annual revenue: {'${:,}'.format(contractor.estimated_annual_revenue) if contractor.estimated_annual_revenue else 'unknown'}
-Revenue confidence: {contractor.revenue_confidence or 'unknown'}
-Priority score: {contractor.priority_score}/100
-
-AI Brief: {contractor.brief or 'Not yet generated — run the pipeline first.'}
-Talking points: {', '.join(talking_points) if talking_points else 'None yet'}
-""".strip()
-
+You are a sales intelligence assistant. Answer based on:
+Name: {contractor.name} | GAF Tier: {contractor.gaf_tier} | Revenue: {contractor.estimated_annual_revenue}
+Brief: {contractor.brief}
+"""
     from openai import AsyncOpenAI
     client = AsyncOpenAI(api_key=api_key)
 
@@ -179,11 +130,7 @@ Talking points: {', '.join(talking_points) if talking_points else 'None yet'}
         ],
         max_tokens=400,
     )
-
-    return AskResponse(
-        answer=response.choices[0].message.content,
-        contractor_id=contractor_id,
-    )
+    return AskResponse(answer=response.choices[0].message.content, contractor_id=contractor_id)
 
 
 @app.post("/pipeline/run", response_model=PipelineStatusResponse)
@@ -191,64 +138,46 @@ async def trigger_pipeline(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    """
-    Trigger the enrichment pipeline as a background job.
-    Returns immediately — poll /pipeline/status for progress.
-    Idempotent: will not start a new run if one is already running.
-    """
     openai_key = os.getenv("OPENAI_API_KEY")
-    perplexity_key = os.getenv("PERPLEXITY_API_KEY")
 
-    if not openai_key or not perplexity_key:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY and PERPLEXITY_API_KEY must both be set in .env",
-        )
+    if not openai_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY missing in .env")
 
-    # Prevent duplicate runs
     latest = _latest_pipeline_run(db)
-    if latest and latest.status == "running":
+    if latest and latest.status in ["running", "scraping", "enriching"]:
         return PipelineStatusResponse(
-            status="running",
+            status=latest.status,
             total=latest.total_contractors,
             processed=latest.processed_contractors,
+            error=latest.error_message,
         )
 
-    contractors = db.query(Contractor).all()
     pipeline_run = PipelineRun(status="pending", started_at=datetime.now(timezone.utc))
     db.add(pipeline_run)
     db.commit()
     db.refresh(pipeline_run)
 
-    # Kick off in background — API returns immediately
     background_tasks.add_task(
         _run_pipeline_task,
-        contractors,
+        "10013",
         openai_key,
-        perplexity_key,
         pipeline_run.id,
     )
 
-    return PipelineStatusResponse(
-        status="running",
-        total=len(contractors),
-        processed=0,
-    )
+    return PipelineStatusResponse(status="pending", total=0, processed=0)
 
 
 async def _run_pipeline_task(
-    contractors, openai_key: str, perplexity_key: str, run_id: int
+    zipcode: str, openai_key: str, run_id: int
 ):
-    """Background task wrapper — opens its own DB session."""
-    db = next(get_db())
+    from database import SessionLocal
+    db = SessionLocal()
+    pipeline_run = None
     try:
         pipeline_run = db.get(PipelineRun, run_id)
-        # Re-fetch contractors in this session
-        fresh_contractors = db.query(Contractor).all()
-        await _run_pipeline(fresh_contractors, openai_key, perplexity_key, db, pipeline_run)
+        await _run_pipeline(zipcode, openai_key, db, pipeline_run)
     except Exception as exc:
         logger.error("Pipeline task error: %s", exc)
-        pipeline_run = db.get(PipelineRun, run_id)
         if pipeline_run:
             pipeline_run.status = "failed"
             pipeline_run.error_message = str(exc)

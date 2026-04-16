@@ -22,6 +22,9 @@ class ContractorResponse(BaseModel):
     estimated_annual_revenue: Optional[int] = None
     revenue_confidence: Optional[str] = None
     priority_score: Optional[int] = None
+    display_score: Optional[int] = None
+    perplexity_score: Optional[int] = None
+    perplexity_insights: Optional[List[str]] = None
     brief: Optional[str] = None
     talking_points: Optional[List[str]] = None
     score_breakdown: Optional[dict] = None
@@ -34,6 +37,16 @@ class ContractorResponse(BaseModel):
     @field_validator("talking_points", mode="before")
     @classmethod
     def parse_talking_points(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return []
+        return v
+
+    @field_validator("perplexity_insights", mode="before")
+    @classmethod
+    def parse_perplexity_insights(cls, v):
         if isinstance(v, str):
             try:
                 return json.loads(v)
